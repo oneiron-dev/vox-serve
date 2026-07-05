@@ -628,6 +628,9 @@ class ModelWorker:
         if len(requests) == 0:
             return
 
+        if getattr(self.model, "windowed_decode_frames", 0) > 0:
+            return self.run_detokenize_windowed(requests)
+
         # Prepare token_ids for multiple chunks from each request
         token_ids = []
         request_chunk_mapping = []  # Track which request each chunk belongs to
@@ -692,6 +695,68 @@ class ModelWorker:
         for req in requests:
             if req.done_lm_generation and (
                 req.audio_decode_idx[-1] + self.detokenize_interval >= len(req.lm_output_audio_tokens)
+            ):
+                req.done_all = True
+
+        return
+
+    def run_detokenize_windowed(self, requests: List[Request]):
+        """Eager windowed detokenization (no decoder cache, no CUDA graph).
+
+        Each chunk is decoded as ``[last K real frames ++ new frames]`` with
+        the plain full decoder, and only the trailing new frames' samples are
+        emitted. Real left context sidesteps the zero-initialized
+        streaming-cache onset corruption (QwenLM/Qwen3-TTS #219/#282); the
+        suffix slice keeps chunk boundaries exact — never emit context
+        samples, never drop new ones (#223). The short final chunk is decoded
+        at its true length instead of pad-and-trim.
+        """
+        if len(requests) == 0:
+            return
+
+        context_frames = self.model.windowed_decode_frames
+        interval = self.detokenize_interval
+        samples_per_frame = self.model.output_audio_length // interval
+
+        for req in requests:
+            for chunk_idx in range(len(req.audio_decode_idx)):
+                decode_idx = req.audio_decode_idx[chunk_idx]
+                ctx_start = max(0, decode_idx - context_frames)
+                window = req.lm_output_audio_tokens[ctx_start : decode_idx + interval]
+                n_new = len(window) - (decode_idx - ctx_start)
+                if n_new <= 0:
+                    continue
+
+                token_ids = torch.cat(window, dim=0).unsqueeze(0)
+                if self.detokenizer_device != self.device:
+                    token_ids = token_ids.to(self.detokenizer_device, non_blocking=True)
+                    torch.cuda.synchronize(device=self.detokenizer_device)
+
+                audio_tensor = self.model.postprocess(token_ids)
+
+                if self.needs_watermarking:
+                    audio_tensor[0, 0] = self.run_watermark(audio_tensor[0, 0], orig_sr=24000)
+
+                audio = audio_tensor[0].detach().cpu().numpy()
+                audio_int16 = (audio * 32767).astype(np.int16)
+
+                # Emit only the new frames' samples, sliced from the END of
+                # the decoded window (#223).
+                sample_count = min(n_new * samples_per_frame, audio_int16.shape[1])
+                audio_int16 = audio_int16[:, audio_int16.shape[1] - sample_count :]
+
+                # TTFA first-chunk silence pre-seed (see BaseLM.first_chunk_frames)
+                first_chunk_frames = getattr(self.model, "first_chunk_frames", None)
+                if decode_idx == 0 and first_chunk_frames is not None:
+                    n_silence = interval - first_chunk_frames
+                    audio_int16 = audio_int16[:, n_silence * samples_per_frame :]
+
+                req.output_audio.put(audio_int16.tobytes())
+
+        # Check if any request is completely done
+        for req in requests:
+            if req.done_lm_generation and (
+                req.audio_decode_idx[-1] + interval >= len(req.lm_output_audio_tokens)
             ):
                 req.done_all = True
 

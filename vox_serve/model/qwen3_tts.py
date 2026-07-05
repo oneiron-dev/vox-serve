@@ -1,4 +1,5 @@
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1053,6 +1054,7 @@ class Qwen3TTSModel(BaseLMWithDepth):
     ):
         # Store detokenize_interval (default to 10 if not provided)
         self._detokenize_interval = detokenize_interval if detokenize_interval is not None else 10
+        self._windowed_decode_frames: Optional[int] = None
 
         if model_name == "qwen3-tts":
             model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
@@ -1272,6 +1274,25 @@ class Qwen3TTSModel(BaseLMWithDepth):
     def detokenize_overlap(self) -> int:
         """Overlap size for detokenization."""
         return 0
+
+    @property
+    def windowed_decode_frames(self) -> int:
+        """Frames of real left context re-decoded with each detokenize chunk.
+
+        Stage-2 onset fix: the cached streaming decoder starts every request
+        on zero-initialized conv/attention caches, audibly corrupting the
+        first window (QwenLM/Qwen3-TTS #219/#282; silence warmup only
+        partially helps because silence codes are OOD for speech onsets).
+        When this is > 0 the worker instead decodes each chunk eagerly as
+        ``[last K real frames ++ new frames]`` with the plain full decoder
+        and emits only the new frames' samples (suffix slice, per #223).
+        The default 25 matches ``chunked_decode``'s offline
+        ``left_context_size``, which reproduces full decode output.
+        Set VOX_DECODE_WINDOW_FRAMES=0 to restore the cached path.
+        """
+        if self._windowed_decode_frames is None:
+            self._windowed_decode_frames = int(os.environ.get("VOX_DECODE_WINDOW_FRAMES", "25"))
+        return self._windowed_decode_frames
 
     @property
     def max_tokens(self) -> int:
@@ -1923,9 +1944,15 @@ class Qwen3TTSModel(BaseLMWithDepth):
                 device=self.device,
             )
 
-        # Initialize decoder cache for streaming audio decoding
-        decoder_cache = self.audio_decoder_initial_cache(batch_size=1)
-        self._warm_decoder_cache(decoder_cache)
+        # Initialize decoder cache for streaming audio decoding. Unused when
+        # windowed decode is active — the worker then re-decodes
+        # [K real context frames ++ new frames] eagerly per chunk instead of
+        # carrying decoder state across chunks.
+        if self.windowed_decode_frames > 0:
+            decoder_cache = None
+        else:
+            decoder_cache = self.audio_decoder_initial_cache(batch_size=1)
+            self._warm_decoder_cache(decoder_cache)
 
         return PreprocessOutput(
             input_tokens=input_tokens,

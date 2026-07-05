@@ -540,6 +540,13 @@ class CudaGraphWorker(ModelWorker):
 
     def _initialize_detokenization_cuda_graphs(self):
         """Initialize CUDA graphs for detokenization phase."""
+        if getattr(self.model, "windowed_decode_frames", 0) > 0:
+            self.logger.info(
+                "Windowed decode active (context=%d frames): skipping detokenization CUDA graph capture.",
+                self.model.windowed_decode_frames,
+            )
+            return
+
         # Use detokenizer device for all detokenization buffers
         with torch.cuda.device(self.detokenizer_device):
             detokenize_input_buffer = torch.zeros(
@@ -1402,6 +1409,11 @@ class CudaGraphWorker(ModelWorker):
         """
         Override parent's run_detokenize to add CUDA graph optimization with padding.
         """
+        if getattr(self.model, "windowed_decode_frames", 0) > 0:
+            # Windowed decode runs eagerly (variable window length can't be
+            # captured in a fixed-shape graph); see BaseWorker.
+            return self.run_detokenize_windowed(requests)
+
         self.nvtx_range_push(f"detokenize_bs{len(requests)}")
         if len(requests) == 0:
             self.nvtx_range_pop()
