@@ -1348,6 +1348,48 @@ class Qwen3TTSModel(BaseLMWithDepth):
             detokenize_interval=self.detokenize_interval,
         )
 
+    def _silence_warmup_codes(self) -> torch.Tensor:
+        """Codec codes for one detokenize window of digital silence.
+
+        The streaming decoder starts every request on zero-initialized conv
+        and attention caches, so the first detokenize window reconstructs
+        its audio against fake context — audibly corrupting the first
+        phonemes (leading-consonant drop / distorted onset; see
+        QwenLM/Qwen3-TTS issue #219 and discussion #282). Encoding real
+        silence once and decoding it into each fresh cache gives the first
+        real window a truthful "speech preceded by silence" left context.
+        """
+        if getattr(self, "_silence_codes", None) is None:
+            n_frames = self.detokenize_interval
+            # 1920 output samples per codec frame at 24 kHz; encode with two
+            # frames of headroom, then keep exactly one window worth.
+            n_samples = (n_frames + 2) * 1920
+            with torch.no_grad():
+                wav = torch.zeros(1, n_samples, device=self.audio_decoder_device)
+                mask = torch.ones(1, n_samples, dtype=torch.long, device=self.audio_decoder_device)
+                codes = self.audio_decoder.encode(wav, mask)[0]  # (T, num_quantizers)
+            self._silence_codes = (
+                codes[:n_frames].transpose(0, 1).unsqueeze(0).contiguous()
+            )  # (1, num_quantizers, n_frames)
+        return self._silence_codes
+
+    def _warm_decoder_cache(self, decoder_cache: "Qwen3TTSDecoderCache") -> None:
+        """Prime a fresh streaming decoder cache by decoding silence into it.
+
+        The decoded audio is discarded; only the cache state matters. Any
+        failure degrades to the old cold-start behaviour instead of killing
+        the request.
+        """
+        try:
+            with torch.no_grad():
+                _, new_cache = self.audio_decoder.decode_chunk(
+                    self._silence_warmup_codes(),
+                    decoder_cache=decoder_cache,
+                )
+            decoder_cache.copy_from(new_cache)
+        except Exception:
+            self.logger.exception("decoder cache silence warmup failed; starting cold")
+
     def is_stop_id(self, token_ids: List[int]) -> bool:
         """Check if the given token ID is a stop token."""
         return token_ids.item() == self.stop_token_id
@@ -1883,6 +1925,7 @@ class Qwen3TTSModel(BaseLMWithDepth):
 
         # Initialize decoder cache for streaming audio decoding
         decoder_cache = self.audio_decoder_initial_cache(batch_size=1)
+        self._warm_decoder_cache(decoder_cache)
 
         return PreprocessOutput(
             input_tokens=input_tokens,
