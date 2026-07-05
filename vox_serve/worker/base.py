@@ -737,7 +737,9 @@ class ModelWorker:
                 if self.needs_watermarking:
                     audio_tensor[0, 0] = self.run_watermark(audio_tensor[0, 0], orig_sr=24000)
 
-                audio = audio_tensor[0].detach().cpu().numpy()
+                # The full decoder runs in the model dtype (bf16), which numpy
+                # cannot represent — cast before conversion.
+                audio = audio_tensor[0].detach().to(torch.float32).cpu().numpy()
                 audio_int16 = (audio * 32767).astype(np.int16)
 
                 # Emit only the new frames' samples, sliced from the END of
