@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 from typing import List
 
@@ -227,12 +228,37 @@ class Scheduler:
         """
         Run the scheduler indefinitely.
         """
+        pause_file = os.environ.get("VOX_PAUSE_FILE")
         if self.async_scheduling:
             asyncio.run(self._run_async_loop())
         else:
             while True:
+                if pause_file and os.path.exists(pause_file):
+                    self._park_for_checkpoint(pause_file)
                 self._step()
                 torch.cuda.synchronize()
+
+    def _park_for_checkpoint(self, pause_file: str) -> None:
+        """Quiesce the loop for an external process checkpoint.
+
+        cuda-checkpoint (e.g. Modal GPU memory snapshots) locks the process's
+        CUDA context; this hot loop calling into CUDA at lock time dies with
+        `unspecified launch failure`. Drain in-flight work, signal readiness
+        via the .ack file, then wait CUDA-free until the pause file is
+        removed by the host.
+        """
+        torch.cuda.synchronize()
+        ack_file = pause_file + ".ack"
+        with open(ack_file, "w") as f:
+            f.write(str(time.time()))
+        self.logger.info("scheduler parked for checkpoint")
+        while os.path.exists(pause_file):
+            time.sleep(0.05)
+        try:
+            os.unlink(ack_file)
+        except OSError:
+            pass
+        self.logger.info("scheduler resumed from checkpoint park")
 
     def _select_lm_requests(self):
         """
