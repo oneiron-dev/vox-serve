@@ -1575,8 +1575,13 @@ class Qwen3TTSModel(BaseLMWithDepth):
         # - voice_design: uses instruct to describe voice, no speaker ID
         # - custom_voice: uses predefined speaker ID
         # - base (voice clone): uses reference audio for speaker embedding
-        is_voice_clone_mode = self.tts_model_type == "base"
-        is_voice_design_mode = self.tts_model_type == "voice_design"
+        # Eiri experiment (VOX_FORCE_CLONE_MODE): build the ICL-clone prompt
+        # layout (ref rows + optional instruct rows) on non-base checkpoints.
+        # The three checkpoints share one architecture; whether the weights
+        # honor ref conditioning outside base is exactly what this measures.
+        force_clone = bool(os.environ.get("VOX_FORCE_CLONE_MODE")) and audio_path is not None
+        is_voice_clone_mode = self.tts_model_type == "base" or force_clone
+        is_voice_design_mode = self.tts_model_type == "voice_design" and not force_clone
         is_custom_voice_mode = self.tts_model_type == "custom_voice"
 
         if not is_voice_clone_mode and not is_voice_design_mode and not is_custom_voice_mode:
