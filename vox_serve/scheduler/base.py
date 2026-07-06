@@ -258,7 +258,15 @@ class Scheduler:
             os.unlink(ack_file)
         except OSError:
             pass
-        self.logger.info("scheduler resumed from checkpoint park")
+        # Reseed on resume: the checkpoint froze RNG state, so every restored
+        # replica would otherwise replay identical sampling forever (verified
+        # live: bit-identical WAVs across two Modal cold restores).
+        import random
+
+        seed = int.from_bytes(os.urandom(8), "little")
+        torch.manual_seed(seed)
+        random.seed(seed)
+        self.logger.info("scheduler resumed from checkpoint park (reseeded)")
 
     def _select_lm_requests(self):
         """
