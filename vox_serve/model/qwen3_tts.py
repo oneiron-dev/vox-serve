@@ -1729,34 +1729,60 @@ class Qwen3TTSModel(BaseLMWithDepth):
         # Calculate sequence length based on mode
         if is_voice_clone_mode and not x_vector_only_mode and ref_codes is not None:
             # ICL mode: includes ref_text + text + ref_codes
-            # Sequence: instruct + role(3) + codec_prefix + speaker_embed + tts_bos +
-            #           ref_text + text + tts_eos + codec_bos + ref_codes + tts_pad
             ref_text_len = ref_text_ids.shape[1] - 5 if ref_text_ids is not None else 0  # Remove template tokens
-            # For input streaming, text_len is prompt_ids.shape[1] - 3 (only skip role tokens, no trailing template)
             text_len_offset = 3 if is_input_streaming else 8
             text_len = prompt_ids.shape[1] - text_len_offset
             ref_codes_len = ref_codes.shape[0]
 
-            seq_len = (
-                (instruct_ids.shape[1] if instruct_ids is not None else 0) +
-                3 +                  # role tokens
-                len(codec_prefix) +  # codec prefix
-                1 +                  # speaker embedding position (pad + codec_pad)
-                1 +                  # tts_bos + codec_pad
-                ref_text_len +       # ref_text tokens (with codec_pad)
-                text_len +           # text tokens (with codec_pad)
-                (0 if is_input_streaming else 1) +  # tts_eos + codec_pad (skip for input streaming)
-                1 +                  # tts_pad + codec_bos
-                ref_codes_len        # ref_codes positions (tts_pad + summed codec)
-            )
-            # Streaming prefill runs through a single 1024-token CUDA graph
-            # bucket (minus batch-padding headroom) and an over-long prefill
-            # RuntimeErrors deep in the worker — fail here with a fixable
-            # message instead. ~900 leaves room for injected text later.
-            if is_input_streaming and seq_len > 900:
-                raise ValueError(
-                    f"ICL prefill too long for input streaming ({seq_len} > 900 tokens); "
-                    f"shorten the reference audio (~12 codec frames/s) or ref_text."
+            if is_input_streaming:
+                # Streaming ICL (eiri patch, upstream generate_icl_prompt
+                # geometry): the text stream (ref_text ++ target text) rides
+                # SUMMED on top of the codec rows [codec_bos, ref_codes...];
+                # text beyond the codec rows would trail into generation, but
+                # with a spoken reference the text is always shorter than its
+                # 12.5Hz code frames — enforce instead of handling overflow.
+                # A sequential text-then-codec prefill (offline layout) makes
+                # the model read the reference codes as covering ALL prefill
+                # text -> immediate EOS at generation start (measured:
+                # 0.06-0.9s audio vs 9s offline for identical ref+text).
+                # Sequence: instruct + role(3) + codec_prefix + speaker +
+                #           tts_bos + (1 + ref_codes_len) overlap rows
+                if ref_text_len + text_len > 1 + ref_codes_len:
+                    raise ValueError(
+                        f"streaming ICL text stream ({ref_text_len}+{text_len} tokens) exceeds "
+                        f"codec rows ({1 + ref_codes_len}); reference audio too short for its text."
+                    )
+                seq_len = (
+                    (instruct_ids.shape[1] if instruct_ids is not None else 0) +
+                    3 +                  # role tokens
+                    len(codec_prefix) +  # codec prefix
+                    1 +                  # speaker embedding position (pad + codec_pad)
+                    1 +                  # tts_bos + codec_pad
+                    1 +                  # codec_bos row (text overlap starts here)
+                    ref_codes_len        # ref_codes rows (text overlap + summed codec)
+                )
+                # Single 1024-token CUDA-graph prefill bucket (minus batch
+                # padding headroom); fail with a fixable message instead of
+                # a bare RuntimeError deep in the worker.
+                if seq_len > 900:
+                    raise ValueError(
+                        f"ICL prefill too long for input streaming ({seq_len} > 900 tokens); "
+                        f"shorten the reference audio (~12 codec frames/s)."
+                    )
+            else:
+                # Sequence: instruct + role(3) + codec_prefix + speaker_embed + tts_bos +
+                #           ref_text + text + tts_eos + codec_bos + ref_codes + tts_pad
+                seq_len = (
+                    (instruct_ids.shape[1] if instruct_ids is not None else 0) +
+                    3 +                  # role tokens
+                    len(codec_prefix) +  # codec prefix
+                    1 +                  # speaker embedding position (pad + codec_pad)
+                    1 +                  # tts_bos + codec_pad
+                    ref_text_len +       # ref_text tokens (with codec_pad)
+                    text_len +           # text tokens (with codec_pad)
+                    1 +                  # tts_eos + codec_pad
+                    1 +                  # tts_pad + codec_bos
+                    ref_codes_len        # ref_codes positions (tts_pad + summed codec)
                 )
         elif is_voice_design_mode:
             # Voice design mode: no speaker token, voice is generated from instruct
@@ -1852,51 +1878,75 @@ class Qwen3TTSModel(BaseLMWithDepth):
         pos += 1
 
         if audio_path is not None and not x_vector_only_mode and ref_codes is not None:
-            # ICL mode: ref_text + text + ref_codes
+            if is_input_streaming:
+                # Streaming ICL (eiri patch): text stream rides summed on top
+                # of the codec rows — see the seq-len comment above. Text
+                # stream = ref_text ++ target tokens seen so far (streaming
+                # prefill carries one target token; the rest inject per
+                # decode step, continuing the same text channel).
+                text_stream = [
+                    ref_text_ids[0, i] for i in range(3, ref_text_ids.shape[1] - 2)
+                ] + [prompt_ids[0, i] for i in range(3, prompt_ids.shape[1])]
 
-            # 6a. Reference text tokens (with codec_pad)
-            for i in range(3, ref_text_ids.shape[1] - 2):  # Skip first 3 and last 2 template tokens
-                input_tokens[pos, -1] = ref_text_ids[0, i]
-                input_tokens[pos, 0] = self.config.talker_config.codec_pad_id
+                # codec_bos row, then ref-code rows; text overlaps from row 0
+                input_tokens[pos, -1] = (
+                    text_stream[0] if text_stream else self.config.tts_pad_token_id
+                )
+                input_tokens[pos, 0] = self.config.talker_config.codec_bos_id
                 input_masks[pos, -1] = True
                 pos += 1
 
-            # 6b. Synthesis text tokens (with codec_pad)
-            # For input streaming: extract all text tokens (only skip first 3 role tokens)
-            # For non-streaming: skip first 3 and last 5 template tokens
-            text_end_idx = prompt_ids.shape[1] if is_input_streaming else (prompt_ids.shape[1] - 5)
-            for i in range(3, text_end_idx):
-                input_tokens[pos, -1] = prompt_ids[0, i]
-                input_tokens[pos, 0] = self.config.talker_config.codec_pad_id
-                input_masks[pos, -1] = True
-                pos += 1
+                ref_codes_start_pos = pos
+                for t in range(ref_codes.shape[0]):
+                    ti = t + 1  # text_stream index (row 0 = codec_bos row)
+                    input_tokens[pos, -1] = (
+                        text_stream[ti] if ti < len(text_stream) else self.config.tts_pad_token_id
+                    )
+                    input_tokens[pos, 0] = ref_codes[t, 0].item()
+                    input_masks[pos, -1] = True
+                    pos += 1
+            else:
+                # ICL mode (offline): ref_text + text + ref_codes
 
-            # 6c. tts_eos + codec_pad (skip for input streaming - EOS will be added when text is complete)
-            if not is_input_streaming:
+                # 6a. Reference text tokens (with codec_pad)
+                for i in range(3, ref_text_ids.shape[1] - 2):  # Skip first 3 and last 2 template tokens
+                    input_tokens[pos, -1] = ref_text_ids[0, i]
+                    input_tokens[pos, 0] = self.config.talker_config.codec_pad_id
+                    input_masks[pos, -1] = True
+                    pos += 1
+
+                # 6b. Synthesis text tokens (with codec_pad)
+                # Skip first 3 and last 5 template tokens
+                for i in range(3, prompt_ids.shape[1] - 5):
+                    input_tokens[pos, -1] = prompt_ids[0, i]
+                    input_tokens[pos, 0] = self.config.talker_config.codec_pad_id
+                    input_masks[pos, -1] = True
+                    pos += 1
+
+                # 6c. tts_eos + codec_pad
                 input_tokens[pos, -1] = self.config.tts_eos_token_id
                 input_tokens[pos, 0] = self.config.talker_config.codec_pad_id
                 input_masks[pos, -1] = True
                 pos += 1
 
-            # 6d. tts_pad + codec_bos
-            input_tokens[pos, -1] = self.config.tts_pad_token_id
-            input_tokens[pos, 0] = self.config.talker_config.codec_bos_id
-            input_masks[pos, -1] = True
-            pos += 1
-
-            # 6e. Reference audio codes (tts_pad + summed codec embeddings)
-            # Pre-compute the summed codec embeddings (cb1 + cb2 + ... + cb(n-1)) for CUDA graph compatibility
-            # Store in input_features so forward() can just add without conditional branching
-            ref_codes_start_pos = pos
-            for t in range(ref_codes.shape[0]):
+                # 6d. tts_pad + codec_bos
                 input_tokens[pos, -1] = self.config.tts_pad_token_id
-                # Store codebook 0 value for this frame (used for codec_embedding in forward)
-                input_tokens[pos, 0] = ref_codes[t, 0].item()
+                input_tokens[pos, 0] = self.config.talker_config.codec_bos_id
                 input_masks[pos, -1] = True
                 pos += 1
 
+                # 6e. Reference audio codes (tts_pad + summed codec embeddings)
+                ref_codes_start_pos = pos
+                for t in range(ref_codes.shape[0]):
+                    input_tokens[pos, -1] = self.config.tts_pad_token_id
+                    # Store codebook 0 value for this frame (used for codec_embedding in forward)
+                    input_tokens[pos, 0] = ref_codes[t, 0].item()
+                    input_masks[pos, -1] = True
+                    pos += 1
+
             # Pre-compute summed codec embeddings for ICL positions (codebooks 1 to depth_n_codebooks-1)
             # This enables CUDA graph compatibility by avoiding conditional branching in forward()
+            # (both layouts: ref-code rows start at ref_codes_start_pos)
             with torch.no_grad():
                 ref_codes_tensor = ref_codes.to(self.device)  # (T, depth_n_codebooks)
                 for cb in range(1, self.depth_n_codebooks):
