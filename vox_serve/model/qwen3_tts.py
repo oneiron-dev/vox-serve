@@ -1595,14 +1595,14 @@ class Qwen3TTSModel(BaseLMWithDepth):
                 f"Please use 'qwen3-tts-base' or 'Qwen/Qwen3-TTS-12Hz-1.7B-Base' model."
             )
 
-        # Validate input streaming compatibility
-        if is_input_streaming:
-            # ICL mode (voice cloning with ref_codes) is not supported with input streaming
-            if is_voice_clone_mode and audio_path is not None and not x_vector_only_mode:
-                raise ValueError(
-                    "Input streaming is not supported with ICL mode (voice cloning with reference audio). "
-                    "Please use x_vector_only_mode=True or disable input streaming."
-                )
+        # Input streaming + full ICL (eiri patch): the streaming ICL branches
+        # below (seq-len calc + token build) lay the complete reference block
+        # (ref_text + codec_bos + ref_codes) into the prefill and inject the
+        # remaining target text per decode step — same interleave the x_vector
+        # streaming path already uses. Upstream guarded this combination off;
+        # validated here by offline-vs-streamed parity on identical ref+text.
+        if is_input_streaming and is_voice_clone_mode and audio_path is not None and not x_vector_only_mode:
+            self.logger.info("input streaming with full ICL voice cloning (eiri patch)")
 
         if language is None:
             language = "auto"
@@ -1749,6 +1749,15 @@ class Qwen3TTSModel(BaseLMWithDepth):
                 1 +                  # tts_pad + codec_bos
                 ref_codes_len        # ref_codes positions (tts_pad + summed codec)
             )
+            # Streaming prefill runs through a single 1024-token CUDA graph
+            # bucket (minus batch-padding headroom) and an over-long prefill
+            # RuntimeErrors deep in the worker — fail here with a fixable
+            # message instead. ~900 leaves room for injected text later.
+            if is_input_streaming and seq_len > 900:
+                raise ValueError(
+                    f"ICL prefill too long for input streaming ({seq_len} > 900 tokens); "
+                    f"shorten the reference audio (~12 codec frames/s) or ref_text."
+                )
         elif is_voice_design_mode:
             # Voice design mode: no speaker token, voice is generated from instruct
             # For input streaming, text_len is prompt_ids.shape[1] - 3 (only skip role tokens, no trailing template)
