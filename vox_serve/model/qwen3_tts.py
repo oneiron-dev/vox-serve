@@ -1747,10 +1747,10 @@ class Qwen3TTSModel(BaseLMWithDepth):
                 # 0.06-0.9s audio vs 9s offline for identical ref+text).
                 # Sequence: instruct + role(3) + codec_prefix + speaker +
                 #           tts_bos + (1 + ref_codes_len) overlap rows
-                if ref_text_len + 1 + text_len > 1 + ref_codes_len:
+                if ref_text_len + text_len > 1 + ref_codes_len:
                     raise ValueError(
-                        f"streaming ICL text stream ({ref_text_len}+1+{text_len} tokens) exceeds "
-                        f"codec rows ({1 + ref_codes_len}); reference audio too short for its text."
+                        f"streaming ICL text stream ({ref_text_len}+{text_len} tokens) exceeds "
+                        f"codec rows ({1 + ref_codes_len}); use a longer reference or open with less text."
                     )
                 seq_len = (
                     (instruct_ids.shape[1] if instruct_ids is not None else 0) +
@@ -1884,16 +1884,16 @@ class Qwen3TTSModel(BaseLMWithDepth):
                 # stream = ref_text ++ target tokens seen so far (streaming
                 # prefill carries one target token; the rest inject per
                 # decode step, continuing the same text channel).
-                # tts_eos between ref and target text closes the reference
-                # segment: without it the model reads ref+target as one text
-                # already covered by the reference codes and emits codec EOS
-                # at generation start (measured, both sequential and overlap
-                # layouts; upstream closes its text stream with eos too).
-                text_stream = (
-                    [ref_text_ids[0, i] for i in range(3, ref_text_ids.shape[1] - 2)]
-                    + [self.config.tts_eos_token_id]
-                    + [prompt_ids[0, i] for i in range(3, prompt_ids.shape[1])]
-                )
+                # Upstream generate_icl_prompt geometry: text stream =
+                # ref_text ++ target text (as much as has arrived — the
+                # scheduler front-loads everything buffered at /start),
+                # overlapped onto the codec rows. tts_eos is NOT laid here:
+                # the worker injects it on the decode step where the text
+                # queue drains after /end, matching upstream's trailing-text
+                # regime. Late-arriving text keeps injecting before that.
+                text_stream = [
+                    ref_text_ids[0, i] for i in range(3, ref_text_ids.shape[1] - 2)
+                ] + [prompt_ids[0, i] for i in range(3, prompt_ids.shape[1])]
 
                 # codec_bos row, then ref-code rows; text overlaps from row 0
                 input_tokens[pos, -1] = (

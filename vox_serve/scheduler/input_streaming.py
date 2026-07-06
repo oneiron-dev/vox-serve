@@ -59,6 +59,23 @@ class InputStreamingScheduler(Scheduler):
             req.prefill_ready = True
             return
 
+        # Full-ICL cloning (eiri patch): the ICL prompt overlaps the text
+        # stream onto the reference codec rows and the model expects the
+        # target text there (upstream generate_icl_prompt) — front-load
+        # everything buffered at start into the prefill instead of one
+        # token. Text arriving later still injects per decode step.
+        is_full_icl = req.audio_path is not None and not (req.model_kwargs or {}).get(
+            "x_vector_only_mode"
+        )
+        if is_full_icl:
+            req.prompt = req.input_text_buffer
+            req.total_text_tokens = 0
+            req.prefill_ready = True
+            self.logger.debug(
+                f"Prefill prepared (full ICL): {len(all_tokens)} tokens front-loaded"
+            )
+            return
+
         # Decode only the first token back to text for minimal prompt
         first_token_text = self.model_worker.model.text_tokenizer.decode(
             [all_tokens[0]], skip_special_tokens=True

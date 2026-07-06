@@ -758,7 +758,10 @@ class ModelWorker:
         # Check if any request is completely done
         for req in requests:
             if req.done_lm_generation and (
-                req.audio_decode_idx[-1] + interval >= len(req.lm_output_audio_tokens)
+                # a request can finish with zero decoded chunks (e.g. EOS on
+                # the first frames) — empty decode_idx means nothing pending
+                not req.audio_decode_idx
+                or req.audio_decode_idx[-1] + interval >= len(req.lm_output_audio_tokens)
             ):
                 req.done_all = True
 
